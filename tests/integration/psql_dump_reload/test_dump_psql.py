@@ -143,7 +143,7 @@ def path_size(dump_path):
 @pytest.mark.parametrize('nr_docs', [100])
 @pytest.mark.parametrize('emb_size', [10])
 @pytest.mark.parametrize('docker_compose', [compose_yml], indirect=['docker_compose'])
-def test_dump_reload(tmpdir, nr_docs, emb_size, shards, docker_compose):
+def test_dump_reload(tmpdir, nr_docs, emb_size, shards, docker_compose, nr_docs_search=3):
     # for psql to start
     time.sleep(2)
     top_k = 5
@@ -188,7 +188,7 @@ def test_dump_reload(tmpdir, nr_docs, emb_size, shards, docker_compose):
             flow_query.rolling_update(pod_name='indexer_query', dump_path=dump_path)
             results = flow_query.post(
                 on='/search',
-                inputs=docs,
+                inputs=docs[:nr_docs_search],
                 parameters={'top_k': top_k},
                 return_results=True,
             )
@@ -220,7 +220,7 @@ def _in_docker():
 )
 @pytest.mark.parametrize('docker_compose', [compose_yml], indirect=['docker_compose'])
 def test_benchmark(tmpdir, docker_compose):
-    nr_docs = 1000
+    nr_docs = 100000
     return test_dump_reload(
         tmpdir, nr_docs=nr_docs, emb_size=128, shards=3, docker_compose=compose_yml
     )
