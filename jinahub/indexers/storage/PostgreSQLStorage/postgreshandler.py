@@ -1,6 +1,9 @@
 __copyright__ = "Copyright (c) 2021 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
+import datetime
+from datetime import time
+
 import psycopg2
 from psycopg2 import pool
 import psycopg2.extras
@@ -26,6 +29,7 @@ class PostgreSQLHandler:
     :param password: the password to authenticate
     :param database: the database name
     :param collection: the collection name
+    :param total_shards: the number of shards to distribute the data (used when rolling update on Searcher side)
     :param args: other arguments
     :param kwargs: other keyword arguments
     """
@@ -39,12 +43,16 @@ class PostgreSQLHandler:
         database: str = 'postgres',
         table: Optional[str] = 'default_table',
         max_connections: int = 5,
+        total_shards: int = 128,
         *args,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.logger = JinaLogger('psq_handler')
         self.table = table
+        self.total_shards = total_shards
+        # TODO maybe restore from a table
+        self._next_shard = 0
 
         try:
             self.postgreSQL_pool = psycopg2.pool.SimpleConnectionPool(
@@ -74,6 +82,7 @@ class PostgreSQLHandler:
 
         Create table if needed with id, vecs and metas.
         """
+        # TODO update if table exists but is in old schema
         connection = self._get_connection()
         cursor = connection.cursor()
         cursor.execute(
@@ -87,7 +96,9 @@ class PostgreSQLHandler:
                 cursor.execute(
                     f'CREATE TABLE {self.table} ( \
                     ID VARCHAR PRIMARY KEY,  \
-                    DOC BYTEA);'
+                    DOC BYTEA, \
+                    SHARD INT, \
+                    LAST_UPDATED TIMESTAMP);'
                 )
                 self.logger.info('Successfully created table')
             except (Exception, psycopg2.Error) as error:
@@ -109,11 +120,14 @@ class PostgreSQLHandler:
         try:
             psycopg2.extras.execute_batch(
                 cursor,
-                f'INSERT INTO {self.table} (ID, DOC) VALUES (%s, %s)',
+                f'INSERT INTO {self.table} (ID, DOC, SHARD, LAST_UPDATED) \
+                VALUES (%s, %s, %s, %s)',
                 [
                     (
                         doc.id,
                         doc.SerializeToString(),
+                        self._get_next_shard(),
+                        self._get_timestamp()
                     )
                     for doc in docs
                 ],
@@ -136,10 +150,14 @@ class PostgreSQLHandler:
         cursor = self.connection.cursor()
         psycopg2.extras.execute_batch(
             cursor,
-            f'UPDATE {self.table} SET DOC = %s WHERE ID = %s',
+            f'UPDATE {self.table} \
+            SET DOC = %s \
+            LAST_UPDATED = %s \
+            WHERE ID = %s',
             [
                 (
                     doc.SerializeToString(),
+                    self._get_timestamp(),
                     doc.id,
                 )
                 for doc in docs
@@ -197,3 +215,32 @@ class PostgreSQLHandler:
         cursor.execute(f'SELECT COUNT(*) from {self.table}')
         records = cursor.fetchall()
         return records[0][0]
+
+    def _get_next_shard(self):
+        next_shard = self._next_shard
+        self._next_shard += 1
+        return next_shard
+
+    def _get_timestamp(self):
+        # TODO is this timezone aware?
+        return datetime.datetime.now()
+
+    def snapshot(self):
+        """
+        Saves the state of the data table in a new table
+        """
+        # TODO add several snapshots
+        # move to separate PSQL instance to not affect performance?
+        snapshot_name = 'snapshot'
+        try:
+            cursor = self.connection.cursor()
+            # TODO move to using a separate database / replica
+            cursor.execute(f'drop table if exists {snapshot_name}')
+            cursor.execute(
+                f'create table {snapshot_name} (like {self.table} including all)'
+            )
+            self.connection.commit()
+            self.logger.info('Successfully created snapshot')
+        except (Exception, psycopg2.Error) as error:
+            self.logger.error(f'Error snapshotting: {error}')
+            self.connection.rollback()

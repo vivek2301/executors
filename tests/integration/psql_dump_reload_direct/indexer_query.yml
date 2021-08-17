@@ -1,0 +1,5 @@
+jtype: FaissPostgresSearcher
+metas:
+  name: compound_query_indexer
+with:
+  total_shards: $SHARDS

@@ -1,3 +1,4 @@
+import datetime
 import os
 import time
 from pathlib import Path
@@ -175,3 +176,25 @@ def test_return_embeddings(docker_compose):
     query2 = DocumentArray([Document(id=doc.id)])
     indexer.search(query2, parameters={"return_embeddings": False})
     assert query2[0].embedding is None
+
+@pytest.mark.parametrize('docker_compose', [compose_yml], indirect=['docker_compose'])
+def test_snapshot(docker_compose):
+    postgres_indexer = PostgreSQLStorage()
+    NR_DOCS = 128
+    original_docs = DocumentArray(
+        list(get_documents(nr=NR_DOCS, chunks=0, same_content=False))
+    )
+
+    # make sure to cleanup if the PSQL instance is kept running
+    postgres_indexer.delete(original_docs, {})
+
+    postgres_indexer.add(original_docs, {})
+    np.testing.assert_equal(postgres_indexer.size, NR_DOCS)
+
+    postgres_indexer.snapshot()
+
+    data = import_vectors('postgres://postgres:123456@127.0.0.1:5432/postgres?table=snapshot', shard_ids=['0'])
+
+    assert len(list(data)) == NR_DOCS // 128
+
+    # TODO test getting delta?

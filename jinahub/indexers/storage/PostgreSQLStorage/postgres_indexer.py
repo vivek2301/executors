@@ -29,6 +29,7 @@ class PostgreSQLStorage(Executor):
     :param database: the database name
     :param table: the table name to use
     :param default_return_embeddings: whether to return embeddings on search or not
+    :param total_shards: the number of shards to distribute the data (used when rolling update on Searcher side)
     :param args: other arguments
     :param kwargs: other keyword arguments
     """
@@ -44,6 +45,8 @@ class PostgreSQLStorage(Executor):
         max_connections=5,
         default_traversal_paths: List[str] = ['r'],
         default_return_embeddings: bool = True,
+        # TODO total pre-allocated shards
+        total_shards: int = 128,
         *args,
         **kwargs,
     ):
@@ -64,6 +67,7 @@ class PostgreSQLStorage(Executor):
             database=self.database,
             table=self.table,
             max_connections=max_connections,
+            total_shards = total_shards
         )
         self.default_return_embeddings = default_return_embeddings
 
@@ -71,7 +75,7 @@ class PostgreSQLStorage(Executor):
         with self.handler as handler:
             # always order the dump by id as integer
             cursor = handler.connection.cursor()
-            cursor.execute(f'SELECT * from {handler.table} ORDER BY ID')
+            cursor.execute(f'SELECT ID, DOC from {handler.table} ORDER BY ID')
             records = cursor.fetchall()
             for rec in records:
                 doc = Document(bytes(rec[1]))
@@ -155,6 +159,7 @@ class PostgreSQLStorage(Executor):
         """
         Close the connections in the connection pool
         """
+        # TODO perhaps store next_shard_to_use?
         self.handler.close()
 
     @requests(on='/search')
@@ -175,3 +180,15 @@ class PostgreSQLStorage(Executor):
                 docs.traverse_flat(traversal_paths),
                 return_embeddings=parameters.get('return_embeddings', self.default_return_embeddings)
             )
+
+    @requests(on='/snapshot')
+    def snapshot(self, **kwargs):
+        # TODO argument with table name, database location
+        # create a duplicate of the table
+        # or send to another PSQL instance to avoid perf hit?
+        with self.handler as postgres_handler:
+            postgres_handler.snapshot()
+
+    @requests(on='/get_snapshot')
+    def get_snapshot(self, parameters: Dict, **kwargs):
+        pass

@@ -87,12 +87,18 @@ class FaissSearcher(Executor):
         self.is_distance = is_distance
 
         self.logger = get_logger(self)
+        # TODO store total shards allocated to this shard
+        self.total_shards_allocated = kwargs.get('total_shards', None)
 
         dump_path = dump_path or kwargs.get('runtime_args').get('dump_path')
         if dump_path is not None:
             self.logger.info('Start building "FaissIndexer" from dump data')
+            # pea_id should be shard ids to get
+            # TODO `dump_path` can be a PSQL conn. string
+            # TODO pass either pea_id or pea_ids allocated
+            if self.total_shards_allocated:
             ids_iter, vecs_iter = import_vectors(
-                dump_path, str(self.runtime_args.pea_id)
+                dump_path, self.total_shards_allocated or [str(self.runtime_args.pea_id)]
             )
             self._ids = np.array(list(ids_iter))
             self._ext2int = {v: i for i, v in enumerate(self._ids)}
