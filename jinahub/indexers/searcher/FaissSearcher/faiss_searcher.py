@@ -1,6 +1,7 @@
 __copyright__ = "Copyright (c) 2021 Jina AI Limited. All rights reserved."
 __license__ = "Apache-2.0"
 
+import os
 import gzip
 from typing import Iterable, Optional, Dict, List
 
@@ -21,10 +22,8 @@ class FaissSearcher(Executor):
         Faiss package dependency is only required at the query time.
 
     :param index_key: index type supported by ``faiss.index_factory``
-    :param train_filepath: the training data file path, e.g ``faiss.tgz`` or `faiss.npy`. The data file is expected
-        to be either `.npy` file from `numpy.save()` or a `.tgz` file from `NumpyIndexer`. If none is provided, `indexed` data will be used
+    :param trained_index_file: the index file dumped from a trained index, e.g., ``faiss.index``. If none is provided, `indexed` data will be used
         to train the Indexer (In that case, one must be careful when sharding is enabled, because every shard will be trained with its own part of data).
-        The data will only be loaded if `requires_training` is set to True.
     :param max_num_training_points: Optional argument to consider only a subset of training points to training data from `train_filepath`.
         The points will be selected randomly from the available points
     :param prefetch_size: the number of data to pre-load into RAM
@@ -41,29 +40,28 @@ class FaissSearcher(Executor):
         import numpy as np
         from jina.executors.indexers.vector.faiss import FaissIndexer
 
-        train_filepath = 'faiss_train.tgz'
-        train_data = np.random.rand(10000, 128)
-        with gzip.open(train_filepath, 'wb', compresslevel=1) as f:
-            f.write(train_data.astype('float32'))
-        indexer = FaissIndexer('PCA64,FLAT', train_filepath)
+        import faiss
+        trained_index_file = os.path.join(os.environ['TEST_WORKSPACE'], 'faiss.index')
+        train_data = np.array(np.random.random([1024, 10]), dtype=np.float32)
+        faiss_index = faiss.index_factory(10, 'IVF10,PQ2')
+        faiss_index.train(train_data)
+        faiss.write_index(faiss_index, trained_index_file)
 
-        # generate a training file in `.npy`
-        train_filepath = 'faiss_train'
-        np.save(train_filepath, train_data)
-        indexer = FaissIndexer('PCA64,FLAT', train_filepath)
+        searcher = FaissSearcher('PCA64,FLAT', trained_index_file=trained_index_file)
+
     """
 
     def __init__(
         self,
         index_key: str = 'Flat',
-        train_filepath: Optional[str] = None,
+        trained_index_file: Optional[str] = None,
         max_num_training_points: Optional[int] = None,
         requires_training: bool = True,
         metric: str = 'l2',
         normalize: bool = False,
         nprobe: int = 1,
         dump_path: Optional[str] = None,
-        prefetch_size: Optional[int] = 10,
+        prefetch_size: Optional[int] = 1000,
         default_traversal_paths: List[str] = ['r'],
         is_distance: bool = False,
         default_top_k: int = 5,
@@ -74,7 +72,8 @@ class FaissSearcher(Executor):
         super().__init__(*args, **kwargs)
         self.index_key = index_key
         self.requires_training = requires_training
-        self.train_filepath = train_filepath if self.requires_training else None
+        self.trained_index_file = trained_index_file
+
         self.max_num_training_points = max_num_training_points
         self.prefetch_size = prefetch_size
         self.metric = metric
@@ -166,49 +165,56 @@ class FaissSearcher(Executor):
                 'Invalid distance metric for Faiss index construction. Defaulting to l2 distance'
             )
 
-        index = self.to_device(
-            index=faiss.index_factory(self.num_dim, self.index_key, metric)
-        )
+        if self.trained_index_file:
+            index = faiss.read_index(str(self.trained_index_file))
+            assert index.metric_type == metric
+            assert index.ntotal == 0
+            assert index.d == self.num_dim
+            assert index.is_trained
+        else:
+            index = faiss.index_factory(self.num_dim, self.index_key, metric)
 
-        if self.requires_training:
-            if self.train_filepath:
-                train_data = self._load_training_data(self.train_filepath)
-
+        index = self.to_device(index=index)
+        if self.requires_training and (not index.is_trained):
+            self.logger.info(f'Taking indexed data as training points')
+            if self.max_num_training_points is None:
+                self._prefetch_data.extend(list(vecs_iter))
             else:
-                self.logger.info(f'Taking indexed data as training points')
-                while (
-                    self.max_num_training_points
-                    and len(self._prefetch_data) < self.max_num_training_points
-                ):
+                while len(self._prefetch_data) < self.max_num_training_points:
                     try:
                         self._prefetch_data.append(next(vecs_iter))
                     except:
                         break
-                train_data = np.stack(self._prefetch_data)
 
-            if train_data is None:
+            train_data = np.stack(self._prefetch_data)
+
+            if (
+                self.max_num_training_points
+                and self.max_num_training_points < train_data.shape[0]
+            ):
                 self.logger.warning(
-                    'Loading training data failed. some faiss indexes require previous training.'
+                    f'From train_data with num_points {train_data.shape[0]}, '
+                    f'sample {self.max_num_training_points} points'
                 )
-            else:
-                if (
-                    self.max_num_training_points
-                    and self.max_num_training_points < train_data.shape[0]
-                ):
-                    self.logger.warning(
-                        f'From train_data with num_points {train_data.shape[0]}, '
-                        f'sample {self.max_num_training_points} points'
-                    )
-                    random_indices = np.random.choice(
-                        train_data.shape[0],
-                        size=min(self.max_num_training_points, train_data.shape[0]),
-                        replace=False,
-                    )
-                    train_data = train_data[random_indices, :]
-                train_data = train_data.astype(np.float32)
-                if self.normalize:
-                    faiss.normalize_L2(train_data)
-                self._train(index, train_data)
+                random_indices = np.random.choice(
+                    train_data.shape[0],
+                    size=min(self.max_num_training_points, train_data.shape[0]),
+                    replace=False,
+                )
+                train_data = train_data[random_indices, :]
+
+            self.logger.info(f'Training Faiss {self.index_key} indexer...')
+            train_data = train_data.astype(np.float32)
+            if self.normalize:
+                faiss.normalize_L2(train_data)
+            self._train(index, train_data)
+
+            self.logger.info(
+                f'Dumping the trained Faiss index to {self.trained_index_file}'
+            )
+            if self.on_gpu:
+                index = faiss.index_gpu_to_cpu(index)
+            faiss.write_index(index, self.trained_index_file)
 
         self.logger.info(f'Building the faiss {self.index_key} index...')
         self._build_partial_index(vecs_iter, index)
@@ -300,58 +306,6 @@ class FaissSearcher(Executor):
         )
 
         index.train(data)
-
-    def _load_training_data(self, train_filepath: str) -> 'np.ndarray':
-        self.logger.info(f'Loading training data from {train_filepath}')
-        result = None
-        try:
-            result = self._load_gzip(train_filepath)
-        except Exception as e:
-            self.logger.error(
-                'Loading training data from gzip failed, filepath={}, {}'.format(
-                    train_filepath, e
-                )
-            )
-
-        if result is None:
-            try:
-                result = np.load(train_filepath)
-                if isinstance(result, np.lib.npyio.NpzFile):
-                    self.logger.warning(
-                        '.npz format is not supported. Please save the array in .npy format.'
-                    )
-                    result = None
-            except Exception as e:
-                self.logger.error(
-                    'Loading training data with np.load failed, filepath={}, {}'.format(
-                        train_filepath, e
-                    )
-                )
-
-        if result is None:
-            try:
-                # Read from binary file:
-                with open(train_filepath, 'rb') as f:
-                    result = f.read()
-            except Exception as e:
-                self.logger.error(
-                    'Loading training data from binary file failed, filepath={}, {}'.format(
-                        train_filepath, e
-                    )
-                )
-        return result
-
-    def _load_gzip(self, abspath: str, mode='rb') -> Optional['np.ndarray']:
-        try:
-            self.logger.info(f'loading index from {abspath}...')
-            with gzip.open(abspath, mode) as fp:
-                return np.frombuffer(fp.read(), dtype=self.dtype).reshape(
-                    [-1, self.num_dim]
-                )
-        except EOFError:
-            self.logger.error(
-                f'{abspath} is broken/incomplete, perhaps forgot to ".close()" in the last usage?'
-            )
 
     @property
     def size(self):
